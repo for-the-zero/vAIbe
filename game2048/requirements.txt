@@ -1,0 +1,13 @@
+# 2048 AI Trainer 依赖
+
+# 深度学习框架
+torch>=2.0.0
+
+# 数值计算 (需要 <2 以兼容 torch)
+numpy<2
+
+# GUI
+PyQt5>=5.15.0
+
+# 绘图
+matplotlib>=3.7.0
