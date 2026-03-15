@@ -1,0 +1,2 @@
+- `cveto/`: [Source](https://www.kaggle.com/datasets/tusonggao/chinese-vs-english-tanslation-corpus/data)
+- `tatoeba.tsv`: [Source](https://tatoeba.org/zh-cn/downloads)
