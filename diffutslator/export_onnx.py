@@ -1,5 +1,5 @@
 """
-导出模型为ONNX格式，用于WebGPU推理
+导出模型为JSON格式，用于WebGPU推理
 """
 
 import os
@@ -7,7 +7,8 @@ import json
 import argparse
 import torch
 import torch.nn as nn
-from typing import Dict, Any
+import numpy as np
+from typing import Dict, Any, List
 
 from config import Config
 from tokenizer import Tokenizer
@@ -16,8 +17,15 @@ from model import create_model
 from diffusion import get_diffusion
 
 
+def tensor_to_list(t) -> list:
+    """将tensor转换为list"""
+    if isinstance(t, torch.Tensor):
+        return t.detach().cpu().numpy().tolist()
+    return t
+
+
 def export_model(config: Config, checkpoint_path: str, output_dir: str):
-    """导出模型为ONNX格式"""
+    """导出模型为JSON格式"""
     
     print(f"加载检查点: {checkpoint_path}")
     state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
@@ -63,11 +71,11 @@ def export_model(config: Config, checkpoint_path: str, output_dir: str):
     diffusion_params = {
         'timesteps': config.diffusion.timesteps,
         'ddim_steps': config.diffusion.ddim_steps,
-        'betas': scheduler.betas.tolist(),
-        'alphas': scheduler.alphas.tolist(),
-        'alphas_cumprod': scheduler.alphas_cumprod.tolist(),
-        'sqrt_alphas_cumprod': scheduler.sqrt_alphas_cumprod.tolist(),
-        'sqrt_one_minus_alphas_cumprod': scheduler.sqrt_one_minus_alphas_cumprod.tolist(),
+        'betas': tensor_to_list(scheduler.betas),
+        'alphas': tensor_to_list(scheduler.alphas),
+        'alphas_cumprod': tensor_to_list(scheduler.alphas_cumprod),
+        'sqrt_alphas_cumprod': tensor_to_list(scheduler.sqrt_alphas_cumprod),
+        'sqrt_one_minus_alphas_cumprod': tensor_to_list(scheduler.sqrt_one_minus_alphas_cumprod),
         'ddim_timesteps': ddim_sampler.ddim_timesteps,
     }
     
@@ -101,27 +109,108 @@ def export_model(config: Config, checkpoint_path: str, output_dir: str):
     
     print("导出分词器完成")
     
-    # 导出嵌入层权重
-    torch.save({
-        'zh_embedding': embedding.zh_embedding.state_dict(),
-        'en_embedding': embedding.en_embedding.state_dict(),
-        'zh_projection': output_proj.zh_projection.state_dict(),
-        'en_projection': output_proj.en_projection.state_dict(),
-    }, os.path.join(output_dir, 'embedding.pt'))
+    # 导出嵌入层权重为JSON
+    def extract_embedding_weights(lang_emb):
+        """提取嵌入层权重"""
+        return {
+            'token_embedding': tensor_to_list(lang_emb.token_embedding.weight),
+            'position_encoding': tensor_to_list(lang_emb.position_encoding.pe),
+            'length_embedding': tensor_to_list(lang_emb.length_embedding.weight),
+            'scale': lang_emb.scale,
+        }
+    
+    embedding_weights = {
+        'zh': extract_embedding_weights(embedding.zh_embedding),
+        'en': extract_embedding_weights(embedding.en_embedding),
+    }
+    
+    with open(os.path.join(output_dir, 'embedding.json'), 'w') as f:
+        json.dump(embedding_weights, f)
     
     print("导出嵌入层完成")
     
-    # 导出噪声预测模型
-    torch.save(model.state_dict(), os.path.join(output_dir, 'model.pt'))
+    # 导出输出投影权重
+    output_weights = {
+        'zh_projection': tensor_to_list(output_proj.zh_projection.projection.weight),
+        'en_projection': tensor_to_list(output_proj.en_projection.projection.weight),
+    }
     
-    print("导出模型完成")
+    with open(os.path.join(output_dir, 'output_proj.json'), 'w') as f:
+        json.dump(output_weights, f)
     
-    # 尝试导出ONNX（可选）
-    try:
-        export_onnx(model, embedding, output_proj, config, output_dir)
-        print("导出ONNX完成")
-    except Exception as e:
-        print(f"ONNX导出跳过: {e}")
+    print("导出输出投影完成")
+    
+    # 导出噪声预测模型权重
+    def extract_model_weights(model):
+        """提取模型权重"""
+        weights = {}
+        
+        # 时间嵌入
+        weights['time_mlp'] = {
+            '0.weight': tensor_to_list(model.time_mlp[0].weight),
+            '0.bias': tensor_to_list(model.time_mlp[0].bias),
+            '2.weight': tensor_to_list(model.time_mlp[2].weight),
+            '2.bias': tensor_to_list(model.time_mlp[2].bias),
+        }
+        
+        # 语言特定投影
+        weights['zh_input_proj'] = {
+            'weight': tensor_to_list(model.zh_input_proj.weight),
+            'bias': tensor_to_list(model.zh_input_proj.bias),
+        }
+        weights['en_input_proj'] = {
+            'weight': tensor_to_list(model.en_input_proj.weight),
+            'bias': tensor_to_list(model.en_input_proj.bias),
+        }
+        weights['zh_output_proj'] = {
+            'weight': tensor_to_list(model.zh_output_proj.weight),
+            'bias': tensor_to_list(model.zh_output_proj.bias),
+        }
+        weights['en_output_proj'] = {
+            'weight': tensor_to_list(model.en_output_proj.weight),
+            'bias': tensor_to_list(model.en_output_proj.bias),
+        }
+        
+        # 输出归一化
+        weights['output_norm'] = {
+            'weight': tensor_to_list(model.output_norm.weight),
+            'bias': tensor_to_list(model.output_norm.bias),
+        }
+        
+        # Transformer层
+        weights['layers'] = []
+        for i, layer in enumerate(model.layers):
+            layer_weights = {
+                # 自注意力
+                'w_q.weight': tensor_to_list(layer.attn.w_q.weight),
+                'w_q.bias': tensor_to_list(layer.attn.w_q.bias),
+                'w_k.weight': tensor_to_list(layer.attn.w_k.weight),
+                'w_k.bias': tensor_to_list(layer.attn.w_k.bias),
+                'w_v.weight': tensor_to_list(layer.attn.w_v.weight),
+                'w_v.bias': tensor_to_list(layer.attn.w_v.bias),
+                'w_o.weight': tensor_to_list(layer.attn.w_o.weight),
+                'w_o.bias': tensor_to_list(layer.attn.w_o.bias),
+                # 前馈网络
+                'w1.weight': tensor_to_list(layer.ff.w1.weight),
+                'w1.bias': tensor_to_list(layer.ff.w1.bias),
+                'w2.weight': tensor_to_list(layer.ff.w2.weight),
+                'w2.bias': tensor_to_list(layer.ff.w2.bias),
+                # LayerNorm
+                'norm1.weight': tensor_to_list(layer.norm1.weight),
+                'norm1.bias': tensor_to_list(layer.norm1.bias),
+                'norm2.weight': tensor_to_list(layer.norm2.weight),
+                'norm2.bias': tensor_to_list(layer.norm2.bias),
+            }
+            weights['layers'].append(layer_weights)
+        
+        return weights
+    
+    model_weights = extract_model_weights(model)
+    
+    with open(os.path.join(output_dir, 'model.json'), 'w') as f:
+        json.dump(model_weights, f)
+    
+    print("导出模型权重完成")
     
     # 导出配置
     config_dict = {
@@ -145,104 +234,8 @@ def export_model(config: Config, checkpoint_path: str, output_dir: str):
         print(f"  {f}: {size:.2f} MB")
 
 
-def export_onnx(model, embedding, output_proj, config, output_dir):
-    """导出ONNX格式"""
-    
-    batch_size = 1
-    seq_len = 32
-    d_model = config.model.d_model
-    
-    # 导出中文嵌入
-    class ZHEmbeddingWrapper(nn.Module):
-        def __init__(self, emb):
-            super().__init__()
-            self.emb = emb
-        
-        def forward(self, token_ids):
-            return self.emb(token_ids)
-    
-    zh_emb_wrapper = ZHEmbeddingWrapper(embedding.zh_embedding)
-    dummy_input = torch.randint(0, 1000, (batch_size, seq_len))
-    
-    torch.onnx.export(
-        zh_emb_wrapper,
-        dummy_input,
-        os.path.join(output_dir, 'zh_embedding.onnx'),
-        input_names=['token_ids'],
-        output_names=['embedding'],
-        dynamic_axes={'token_ids': {0: 'batch', 1: 'seq'}, 'embedding': {0: 'batch', 1: 'seq'}},
-        opset_version=14,
-    )
-    
-    # 导出英文嵌入
-    class ENEmbeddingWrapper(nn.Module):
-        def __init__(self, emb):
-            super().__init__()
-            self.emb = emb
-        
-        def forward(self, token_ids):
-            return self.emb(token_ids)
-    
-    en_emb_wrapper = ENEmbeddingWrapper(embedding.en_embedding)
-    
-    torch.onnx.export(
-        en_emb_wrapper,
-        dummy_input,
-        os.path.join(output_dir, 'en_embedding.onnx'),
-        input_names=['token_ids'],
-        output_names=['embedding'],
-        dynamic_axes={'token_ids': {0: 'batch', 1: 'seq'}, 'embedding': {0: 'batch', 1: 'seq'}},
-        opset_version=14,
-    )
-    
-    # 导出噪声预测模型
-    class ModelWrapper(nn.Module):
-        def __init__(self, model):
-            super().__init__()
-            self.model = model
-        
-        def forward(self, x_t, t):
-            return self.model(x_t, t, lang='zh')  # 默认中文
-    
-    model_wrapper = ModelWrapper(model)
-    
-    dummy_x = torch.randn(batch_size, seq_len, d_model)
-    dummy_t = torch.zeros(batch_size, dtype=torch.long)
-    
-    torch.onnx.export(
-        model_wrapper,
-        (dummy_x, dummy_t),
-        os.path.join(output_dir, 'model.onnx'),
-        input_names=['x_t', 't'],
-        output_names=['noise_pred'],
-        dynamic_axes={'x_t': {0: 'batch', 1: 'seq'}, 't': {0: 'batch'}, 'noise_pred': {0: 'batch', 1: 'seq'}},
-        opset_version=14,
-    )
-    
-    # 导出输出投影
-    class OutputWrapper(nn.Module):
-        def __init__(self, proj):
-            super().__init__()
-            self.proj = proj
-        
-        def forward(self, x):
-            return self.proj(x)
-    
-    zh_out_wrapper = OutputWrapper(output_proj.zh_projection)
-    
-    torch.onnx.export(
-        zh_out_wrapper,
-        dummy_x,
-        os.path.join(output_dir, 'zh_output.onnx'),
-        input_names=['hidden'],
-        output_names=['logits'],
-        dynamic_axes={'hidden': {0: 'batch', 1: 'seq'}, 'logits': {0: 'batch', 1: 'seq'}},
-        opset_version=14,
-    )
-
-
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="导出模型为ONNX格式")
+    parser = argparse.ArgumentParser(description="导出模型为JSON格式")
     parser.add_argument("--checkpoint", type=str, default="checkpoints/best.pt", help="检查点路径")
     parser.add_argument("--output", type=str, default="web/models", help="输出目录")
     
