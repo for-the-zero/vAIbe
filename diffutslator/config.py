@@ -42,6 +42,10 @@ class DiffusionConfig:
     
     # 长度变化
     length_noise_scale: float = 0.3  # 扩散时长度变化的噪声程度
+    
+    # 跨语言扩散
+    interpolation_strength: float = 0.8  # 语言插值强度 (0-1)
+    cross_lingual_mode: bool = True  # 是否使用跨语言扩散模式
 
 
 @dataclass
@@ -56,6 +60,7 @@ class TrainingConfig:
     
     epochs: int = 10
     save_every: int = 1          # 每多少epoch保存一次
+    save_every_steps: int = 500  # 每多少步保存一次（不打断训练）
     eval_every: int = 100        # 每多少步评估一次
     
     # 快速验证模式
@@ -70,8 +75,7 @@ class TrainingConfig:
 @dataclass
 class DataConfig:
     """数据配置"""
-    # 数据集路径
-    tatoeba_path: str = "../_dataset/tatoeba.tsv"
+    # 数据集路径 (只使用 cveto)
     cveto_zh_path: str = "../_dataset/cveto/train.zh"
     cveto_en_path: str = "../_dataset/cveto/train.en"
     
@@ -83,6 +87,9 @@ class DataConfig:
     # 缓存
     use_cache: bool = True       # 是否缓存预处理后的数据
     cache_dir: str = ".cache"
+    
+    # 异步 tokenize 缓存
+    tokenize_cache_size: int = 50  # tokenize 缓存上限
 
 
 @dataclass
@@ -100,9 +107,7 @@ class Config:
         # 设置项目根目录
         self.project_dir = os.path.dirname(os.path.abspath(__file__))
         
-        # 更新相对路径为绝对路径
-        if not os.path.isabs(self.data.tatoeba_path):
-            self.data.tatoeba_path = os.path.join(self.project_dir, self.data.tatoeba_path)
+        # 更新相对路径为绝对路径 (只使用 cveto)
         if not os.path.isabs(self.data.cveto_zh_path):
             self.data.cveto_zh_path = os.path.join(self.project_dir, self.data.cveto_zh_path)
         if not os.path.isabs(self.data.cveto_en_path):

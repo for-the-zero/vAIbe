@@ -40,6 +40,8 @@ class DiffusionConfig:
     beta_start: float = 0.0001
     beta_end: float = 0.02
     length_noise_scale: float = 0.3
+    interpolation_strength: float = 0.8  # 语言插值强度
+    cross_lingual_mode: bool = True  # 跨语言扩散模式
 
 
 @dataclass
@@ -372,83 +374,132 @@ class DualOutputProjection(nn.Module):
 
 
 class MultiHeadAttention(nn.Module):
-    """多头自注意力"""
+    """改进的多头自注意力 - 合并 QKV 投影"""
     
     def __init__(self, d_model: int, n_heads: int, dropout: float = 0.1):
         super().__init__()
         assert d_model % n_heads == 0
+        
         self.d_model = d_model
         self.n_heads = n_heads
         self.d_k = d_model // n_heads
-        self.w_q = nn.Linear(d_model, d_model)
-        self.w_k = nn.Linear(d_model, d_model)
-        self.w_v = nn.Linear(d_model, d_model)
-        self.w_o = nn.Linear(d_model, d_model)
+        self.scale = math.sqrt(self.d_k)
+        
+        # 合并 QKV 投影（更高效）
+        self.qkv = nn.Linear(d_model, d_model * 3, bias=False)
+        self.w_o = nn.Linear(d_model, d_model, bias=False)
+        
         self.dropout = nn.Dropout(dropout)
     
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         batch_size = q.size(0)
-        q = self.w_q(q).view(batch_size, -1, self.n_heads, self.d_k).transpose(1, 2)
-        k = self.w_k(k).view(batch_size, -1, self.n_heads, self.d_k).transpose(1, 2)
-        v = self.w_v(v).view(batch_size, -1, self.n_heads, self.d_k).transpose(1, 2)
-        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.d_k)
+        seq_len = q.size(1)
+        
+        # 合并计算 QKV
+        qkv = self.qkv(q)
+        q, k, v = qkv.chunk(3, dim=-1)
+        
+        # 分头
+        q = q.view(batch_size, seq_len, self.n_heads, self.d_k).transpose(1, 2)
+        k = k.view(batch_size, -1, self.n_heads, self.d_k).transpose(1, 2)
+        v = v.view(batch_size, -1, self.n_heads, self.d_k).transpose(1, 2)
+        
+        # 注意力计算
+        scores = torch.matmul(q, k.transpose(-2, -1)) / self.scale
+        
         if mask is not None:
             scores = scores.masked_fill(mask == 0, float('-inf'))
+        
         attn = F.softmax(scores, dim=-1)
         attn = self.dropout(attn)
+        
+        # 合并头
         out = torch.matmul(attn, v)
-        out = out.transpose(1, 2).contiguous().view(batch_size, -1, self.d_model)
+        out = out.transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)
+        
         return self.w_o(out)
 
 
 class FeedForward(nn.Module):
-    """前馈网络"""
+    """前馈网络 - 使用 GLU 结构"""
     
-    def __init__(self, d_model: int, d_ff: int, dropout: float = 0.1):
+    def __init__(self, d_model: int, d_ff: int, dropout: float = 0.1, use_glu: bool = True):
         super().__init__()
-        self.w1 = nn.Linear(d_model, d_ff)
-        self.w2 = nn.Linear(d_ff, d_model)
+        self.use_glu = use_glu
+        
+        if use_glu:
+            # GLU 结构 - 更好的表达能力
+            self.w1 = nn.Linear(d_model, d_ff * 2)
+            self.w2 = nn.Linear(d_ff, d_model)
+        else:
+            self.w1 = nn.Linear(d_model, d_ff)
+            self.w2 = nn.Linear(d_ff, d_model)
+        
         self.dropout = nn.Dropout(dropout)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.dropout(self.w2(F.gelu(self.w1(x))))
+        if self.use_glu:
+            x, gate = self.w1(x).chunk(2, dim=-1)
+            x = F.gelu(x) * F.gelu(gate)
+        else:
+            x = F.gelu(self.w1(x))
+        return self.dropout(self.w2(x))
 
 
 class TransformerBlock(nn.Module):
-    """Transformer块"""
+    """Transformer块 - Pre-LayerNorm 结构"""
     
     def __init__(self, d_model: int, n_heads: int, d_ff: int, dropout: float = 0.1):
         super().__init__()
-        self.attn = MultiHeadAttention(d_model, n_heads, dropout)
-        self.ff = FeedForward(d_model, d_ff, dropout)
+        
+        # Pre-LayerNorm 结构
         self.norm1 = nn.LayerNorm(d_model)
+        self.attn = MultiHeadAttention(d_model, n_heads, dropout)
+        
         self.norm2 = nn.LayerNorm(d_model)
+        self.ff = FeedForward(d_model, d_ff, dropout, use_glu=True)
+        
         self.dropout = nn.Dropout(dropout)
     
     def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # 自注意力 + 残差 (Pre-LN)
         x = x + self.dropout(self.attn(self.norm1(x), self.norm1(x), self.norm1(x), mask))
+        # 前馈 + 残差 (Pre-LN)
         x = x + self.dropout(self.ff(self.norm2(x)))
         return x
 
 
 class DualNoisePredictor(nn.Module):
-    """双语言噪声预测器"""
+    """双语言噪声预测器 - 使用先进架构"""
     
     def __init__(self, d_model: int = 256, n_heads: int = 4, n_layers: int = 4, d_ff: int = 512, max_len: int = 128, dropout: float = 0.1):
         super().__init__()
         self.d_model = d_model
         
-        # 时间步嵌入（共享）
-        self.time_embedding = SinusoidalTimeEmbedding(d_model)
-        self.time_mlp = nn.Sequential(
+        # 时间步嵌入（共享）- 使用 TimeEmbedding 结构
+        self.time_embedding = nn.Module()
+        self.time_embedding.sinusoidal = SinusoidalTimeEmbedding(d_model)
+        self.time_embedding.mlp = nn.Sequential(
             nn.Linear(d_model, d_model * 4),
-            nn.GELU(),
+            nn.SiLU(),
+            nn.Linear(d_model * 4, d_model * 4),
+            nn.SiLU(),
             nn.Linear(d_model * 4, d_model),
         )
         
-        # 语言特定的输入投影
-        self.zh_input_proj = nn.Linear(d_model, d_model)
-        self.en_input_proj = nn.Linear(d_model, d_model)
+        # 语言特定的输入投影（多层）
+        self.zh_input_proj = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.LayerNorm(d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model),
+        )
+        self.en_input_proj = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.LayerNorm(d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model),
+        )
         
         # 共享Transformer层
         self.layers = nn.ModuleList([
@@ -456,16 +507,26 @@ class DualNoisePredictor(nn.Module):
             for _ in range(n_layers)
         ])
         
-        # 语言特定的输出投影
-        self.zh_output_proj = nn.Linear(d_model, d_model)
-        self.en_output_proj = nn.Linear(d_model, d_model)
+        # 语言特定的输出投影（多层）
+        self.zh_output_proj = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.LayerNorm(d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model),
+        )
+        self.en_output_proj = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.LayerNorm(d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model),
+        )
         
         self.output_norm = nn.LayerNorm(d_model)
     
     def forward(self, x_t: torch.Tensor, t: torch.Tensor, lang: str = "zh", mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         # 时间步嵌入
-        t_emb = self.time_embedding(t)
-        t_emb = self.time_mlp(t_emb)
+        t_emb = self.time_embedding.sinusoidal(t)
+        t_emb = self.time_embedding.mlp(t_emb)
         
         # 语言特定输入投影
         if lang == "zh":
@@ -530,10 +591,13 @@ class LanguageSwitcher(nn.Module):
 
 
 # ==================== 扩散过程 ====================
-class Diffusion:
+class CrossLingualDiffusion:
+    """跨语言扩散模型：支持源语言和目标语言之间的插值"""
+    
     def __init__(self, config: DiffusionConfig):
         self.config = config
         self.timesteps = config.timesteps
+        self.interpolation_strength = config.interpolation_strength
         
         # Beta schedule (linear)
         betas = torch.linspace(config.beta_start, config.beta_end, self.timesteps)
@@ -549,15 +613,64 @@ class Diffusion:
     def register_buffer(self, name: str, tensor: torch.Tensor):
         setattr(self, name, tensor)
     
-    def q_sample(self, x_0: torch.Tensor, t: torch.Tensor, noise: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+    def get_interpolation_factor(self, t: torch.Tensor) -> torch.Tensor:
+        """计算插值因子（smoothstep平滑过渡）"""
+        normalized_t = t.float() / self.timesteps
+        # smoothstep: 3t^2 - 2t^3
+        factor = normalized_t * normalized_t * (3 - 2 * normalized_t)
+        return factor * self.interpolation_strength
+    
+    def _align_sequences(self, x_source: torch.Tensor, x_target: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, int]:
+        """对齐两个序列到相同长度"""
+        source_len = x_source.size(1)
+        target_len = x_target.size(1)
+        target_seq_len = max(source_len, target_len)
+        
+        if source_len < target_seq_len:
+            # 填充源序列
+            pad_len = target_seq_len - source_len
+            x_source_aligned = F.pad(x_source, (0, 0, 0, pad_len))
+        else:
+            x_source_aligned = x_source
+        
+        if target_len < target_seq_len:
+            # 填充目标序列
+            pad_len = target_seq_len - target_len
+            x_target_aligned = F.pad(x_target, (0, 0, 0, pad_len))
+        else:
+            x_target_aligned = x_target
+        
+        return x_source_aligned, x_target_aligned, target_seq_len
+    
+    def q_sample(
+        self,
+        x_source: torch.Tensor,
+        x_target: torch.Tensor,
+        t: torch.Tensor,
+        noise: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """跨语言前向扩散：源语言和目标语言之间的插值 + 加噪"""
+        # 对齐序列
+        x_source_aligned, x_target_aligned, seq_len = self._align_sequences(x_source, x_target)
+        
         if noise is None:
-            noise = torch.randn_like(x_0)
+            noise = torch.randn_like(x_source_aligned)
+        
+        # 计算插值因子
+        interp_factor = self.get_interpolation_factor(t).view(-1, 1, 1)
+        
+        # 插值：从源语言逐渐过渡到目标语言
+        x_interp = (1 - interp_factor) * x_source_aligned + interp_factor * x_target_aligned
+        
+        # 加噪
         sqrt_alpha = self.sqrt_alphas_cumprod[t]
         sqrt_one_minus_alpha = self.sqrt_one_minus_alphas_cumprod[t]
-        x_t = sqrt_alpha.view(-1, 1, 1) * x_0 + sqrt_one_minus_alpha.view(-1, 1, 1) * noise
+        x_t = sqrt_alpha.view(-1, 1, 1) * x_interp + sqrt_one_minus_alpha.view(-1, 1, 1) * noise
+        
         return x_t, noise
     
     def p_sample(self, x_t: torch.Tensor, t: torch.Tensor, predicted_noise: torch.Tensor) -> torch.Tensor:
+        """反向扩散单步"""
         beta = self.betas[t]
         sqrt_one_minus_alpha = self.sqrt_one_minus_alphas_cumprod[t]
         sqrt_recip_alpha = 1.0 / torch.sqrt(self.alphas[t])
@@ -576,7 +689,7 @@ class Diffusion:
 
 
 class DDIMSampler:
-    def __init__(self, diffusion: Diffusion, ddim_steps: int = 50):
+    def __init__(self, diffusion: CrossLingualDiffusion, ddim_steps: int = 50):
         self.diffusion = diffusion
         self.ddim_steps = ddim_steps
         
@@ -651,7 +764,7 @@ class Translator:
             dropout=0.0,
         )
         
-        self.diffusion = Diffusion(self.diffusion_config)
+        self.diffusion = CrossLingualDiffusion(self.diffusion_config)
         
         # 加载权重
         self._load_checkpoint(os.path.join(model_dir, "best.pt"))
@@ -690,7 +803,7 @@ class Translator:
         ddim_steps: int = 50,
         show_process: bool = False,
     ) -> Tuple[str, List[str]]:
-        """翻译文本，返回结果和中间过程"""
+        """翻译文本，返回结果和中间过程（跨语言扩散）"""
         self.model.eval()
         self.embedding.eval()
         self.output_proj.eval()
@@ -709,24 +822,27 @@ class Translator:
         # 嵌入源语言
         source_emb = self.embedding(source_ids, source_lang, source_len)
         
-        # 前向扩散到纯噪声
+        # 初始状态：使用跨语言扩散的前向过程
         batch_size = source_emb.size(0)
-        t_full = torch.full((batch_size,), self.diffusion_config.timesteps - 1, dtype=torch.long)
-        noise = torch.randn_like(source_emb)
-        x_t, _ = self.diffusion.q_sample(source_emb, t_full, noise)
+        t_start = torch.full((batch_size,), self.diffusion_config.timesteps - 1, dtype=torch.long)
+        noise_start = torch.randn_like(source_emb)
+        
+        # 模拟目标语言嵌入（随机噪声 + 源语言信息）
+        target_emb_fake = torch.randn_like(source_emb) * 0.3 + source_emb * 0.7
+        x_t, _ = self.diffusion.q_sample(source_emb, target_emb_fake, t_start, noise_start)
         
         # DDIM反向扩散
         timesteps = ddim_sampler.ddim_timesteps
         total_steps = len(timesteps)
-        switch_point = total_steps // 2
         
         process_steps = []
         
         for i, t in enumerate(timesteps[:-1]):
             t_prev = timesteps[i + 1]
             
-            # 语言切换
-            if i < switch_point:
+            # 计算进度，决定当前语言
+            progress = i / total_steps
+            if progress < 0.3:
                 current_lang = source_lang
             else:
                 current_lang = target_lang
@@ -739,7 +855,7 @@ class Translator:
             if show_process and i % max(1, total_steps // 10) == 0:
                 current_ids = self._embed_to_tokens(x_t, current_lang)
                 current_text = self._decode(current_ids, current_lang)
-                process_steps.append(f"Step {t.item()}: {current_text[:50]}")
+                process_steps.append(f"Step {t.item()} [{current_lang}]: {current_text[:50]}")
             
             # DDIM步骤
             x_t = ddim_sampler.ddim_step(x_t, t.item(), t_prev.item(), predicted_noise, eta=0.0)

@@ -1,6 +1,6 @@
 """
 扩散核心
-实现前向扩散和反向扩散，支持DDIM加速
+实现前向扩散和反向扩散，支持跨语言渐变扩散
 """
 
 import math
@@ -61,8 +61,218 @@ class NoiseScheduler:
         return self
 
 
+class CrossLingualDiffusion:
+    """跨语言渐变扩散过程
+    
+    核心思想：从源语言嵌入渐变到目标语言嵌入，而不是加噪到纯噪声
+    - t=0: 源语言嵌入
+    - t=T: 目标语言嵌入
+    - 中间: 插值 + 噪声
+    
+    注意：处理变长序列时，使用零填充对齐
+    """
+    
+    def __init__(self, scheduler: NoiseScheduler, interpolation_strength: float = 0.8):
+        self.scheduler = scheduler
+        self.timesteps = scheduler.timesteps
+        self.interpolation_strength = interpolation_strength  # 语言插值强度 (0-1)
+    
+    def get_interpolation_factor(self, t: torch.Tensor) -> torch.Tensor:
+        """获取时间步 t 对应的语言插值因子
+        
+        t=0 -> factor=0 (源语言)
+        t=T -> factor=1 (目标语言)
+        """
+        # 使用 sigmoid 平滑过渡
+        normalized_t = t.float() / self.timesteps
+        # 使用 smoothstep 实现更平滑的过渡
+        factor = normalized_t * normalized_t * (3 - 2 * normalized_t)
+        return factor * self.interpolation_strength
+    
+    def _align_sequences(
+        self,
+        x_source: torch.Tensor,
+        x_target: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, int]:
+        """对齐两个序列到相同长度
+        
+        Args:
+            x_source: [batch, seq_len_s, d_model]
+            x_target: [batch, seq_len_t, d_model]
+        
+        Returns:
+            x_source_aligned: 对齐后的源序列
+            x_target_aligned: 对齐后的目标序列
+            target_len: 目标长度
+        """
+        batch_size, seq_len_s, d_model = x_source.shape
+        _, seq_len_t, _ = x_target.shape
+        
+        # 选择较长的长度作为目标
+        target_len = max(seq_len_s, seq_len_t)
+        
+        # 如果长度相同，直接返回
+        if seq_len_s == seq_len_t:
+            return x_source, x_target, target_len
+        
+        # 对源序列进行填充或截断
+        if seq_len_s < target_len:
+            # 填充
+            padding = torch.zeros(batch_size, target_len - seq_len_s, d_model, 
+                                  device=x_source.device, dtype=x_source.dtype)
+            x_source_aligned = torch.cat([x_source, padding], dim=1)
+        else:
+            # 截断
+            x_source_aligned = x_source[:, :target_len, :]
+        
+        # 对目标序列进行填充或截断
+        if seq_len_t < target_len:
+            # 填充
+            padding = torch.zeros(batch_size, target_len - seq_len_t, d_model,
+                                  device=x_target.device, dtype=x_target.dtype)
+            x_target_aligned = torch.cat([x_target, padding], dim=1)
+        else:
+            # 截断
+            x_target_aligned = x_target[:, :target_len, :]
+        
+        return x_source_aligned, x_target_aligned, target_len
+    
+    def q_sample(
+        self,
+        x_source: torch.Tensor,
+        x_target: torch.Tensor,
+        t: torch.Tensor,
+        noise: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """跨语言前向扩散：从源语言渐变到目标语言
+        
+        Args:
+            x_source: 源语言嵌入 [batch, seq_len, d_model]
+            x_target: 目标语言嵌入 [batch, seq_len, d_model]
+            t: 时间步 [batch]
+            noise: 可选噪声
+        
+        Returns:
+            x_t: 渐变后的嵌入
+            noise: 使用的噪声
+        """
+        # 对齐序列长度
+        x_source_aligned, x_target_aligned, target_len = self._align_sequences(x_source, x_target)
+        
+        if noise is None:
+            noise = torch.randn_like(x_source_aligned)
+        
+        # 获取插值因子
+        interp_factor = self.get_interpolation_factor(t).view(-1, 1, 1)
+        
+        # 语言插值
+        x_interp = (1 - interp_factor) * x_source_aligned + interp_factor * x_target_aligned
+        
+        # 添加噪声
+        sqrt_alpha = self.scheduler.sqrt_alphas_cumprod[t].view(-1, 1, 1)
+        sqrt_one_minus_alpha = self.scheduler.sqrt_one_minus_alphas_cumprod[t].view(-1, 1, 1)
+        
+        x_t = sqrt_alpha * x_interp + sqrt_one_minus_alpha * noise
+        
+        return x_t, noise
+    
+    def q_sample_single_lang(
+        self,
+        x_0: torch.Tensor,
+        t: torch.Tensor,
+        noise: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """单语言前向扩散（用于训练稳定性）
+        
+        Args:
+            x_0: 初始嵌入 [batch, seq_len, d_model]
+            t: 时间步 [batch]
+            noise: 可选噪声
+        
+        Returns:
+            x_t: 加噪后的嵌入
+            noise: 使用的噪声
+        """
+        if noise is None:
+            noise = torch.randn_like(x_0)
+        
+        # 获取系数
+        sqrt_alpha = self.scheduler.sqrt_alphas_cumprod[t]
+        sqrt_one_minus_alpha = self.scheduler.sqrt_one_minus_alphas_cumprod[t]
+        
+        # 扩展维度以匹配序列
+        sqrt_alpha = sqrt_alpha.view(-1, 1, 1)
+        sqrt_one_minus_alpha = sqrt_one_minus_alpha.view(-1, 1, 1)
+        
+        # 加噪
+        x_t = sqrt_alpha * x_0 + sqrt_one_minus_alpha * noise
+        
+        return x_t, noise
+    
+    def p_sample(
+        self,
+        x_t: torch.Tensor,
+        t: torch.Tensor,
+        predicted_noise: torch.Tensor,
+    ) -> torch.Tensor:
+        """反向扩散：从x_t采样x_{t-1}
+        
+        Args:
+            x_t: 当前噪声状态 [batch, seq_len, d_model]
+            t: 当前时间步 [batch]
+            predicted_noise: 预测的噪声
+        
+        Returns:
+            x_{t-1}
+        """
+        # 获取系数
+        sqrt_recip_alpha = self.scheduler.sqrt_recip_alphas[t]
+        sqrt_one_minus_alpha = self.scheduler.sqrt_one_minus_alphas_cumprod[t]
+        beta = self.scheduler.betas[t]
+        
+        # 扩展维度
+        sqrt_recip_alpha = sqrt_recip_alpha.view(-1, 1, 1)
+        sqrt_one_minus_alpha = sqrt_one_minus_alpha.view(-1, 1, 1)
+        beta = beta.view(-1, 1, 1)
+        
+        # 计算均值
+        mean = sqrt_recip_alpha * (x_t - beta * predicted_noise / sqrt_one_minus_alpha)
+        
+        # 添加噪声（除了t=0）
+        if t[0] > 0:
+            posterior_var = self.scheduler.posterior_variance[t].view(-1, 1, 1)
+            noise = torch.randn_like(x_t)
+            x_t_minus_1 = mean + torch.sqrt(posterior_var) * noise
+        else:
+            x_t_minus_1 = mean
+        
+        return x_t_minus_1
+    
+    def predict_x0(
+        self,
+        x_t: torch.Tensor,
+        t: torch.Tensor,
+        predicted_noise: torch.Tensor,
+    ) -> torch.Tensor:
+        """从噪声状态预测原始嵌入
+        
+        Args:
+            x_t: 当前噪声状态
+            t: 时间步
+            predicted_noise: 预测的噪声
+        
+        Returns:
+            预测的原始嵌入
+        """
+        sqrt_alpha = self.scheduler.sqrt_alphas_cumprod[t].view(-1, 1, 1)
+        sqrt_one_minus_alpha = self.scheduler.sqrt_one_minus_alphas_cumprod[t].view(-1, 1, 1)
+        
+        x_0 = (x_t - sqrt_one_minus_alpha * predicted_noise) / sqrt_alpha
+        return x_0
+
+
 class DiffusionProcess:
-    """扩散过程"""
+    """标准扩散过程（向后兼容）"""
     
     def __init__(self, scheduler: NoiseScheduler):
         self.scheduler = scheduler
@@ -204,7 +414,6 @@ class DDIMSampler:
             x_{t-1}
         """
         device = x_t.device
-        batch_size = x_t.size(0)
         
         # 获取alpha
         alpha_t = self.scheduler.alphas_cumprod[t]
@@ -285,6 +494,23 @@ def get_diffusion(config) -> Tuple[DiffusionProcess, DDIMSampler]:
     )
     
     diffusion = DiffusionProcess(scheduler)
+    ddim_sampler = DDIMSampler(scheduler, ddim_steps=config.diffusion.ddim_steps)
+    
+    return diffusion, ddim_sampler
+
+
+def get_cross_lingual_diffusion(config) -> Tuple[CrossLingualDiffusion, DDIMSampler]:
+    """创建跨语言扩散过程和采样器"""
+    scheduler = NoiseScheduler(
+        timesteps=config.diffusion.timesteps,
+        beta_start=config.diffusion.beta_start,
+        beta_end=config.diffusion.beta_end,
+    )
+    
+    diffusion = CrossLingualDiffusion(
+        scheduler,
+        interpolation_strength=getattr(config.diffusion, 'interpolation_strength', 0.8)
+    )
     ddim_sampler = DDIMSampler(scheduler, ddim_steps=config.diffusion.ddim_steps)
     
     return diffusion, ddim_sampler

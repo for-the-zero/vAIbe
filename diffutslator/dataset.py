@@ -1,11 +1,13 @@
 """
 数据集加载
-支持tatoeba和cveto数据集
+只使用cveto数据集
 """
 
 import os
 import sys
 import random
+import threading
+import queue
 import psutil
 from typing import List, Tuple, Optional, Dict, Any
 from dataclasses import dataclass
@@ -80,6 +82,122 @@ class TranslationDataset(Dataset):
         return result
 
 
+class AsyncTokenizeDataset(Dataset):
+    """支持异步 tokenize 的翻译数据集
+    
+    后台线程预取和 tokenize 数据，缓存上限可配置
+    """
+    
+    def __init__(
+        self,
+        pairs: List[TranslationPair],
+        zh_tokenizer: Tokenizer,
+        en_tokenizer: Tokenizer,
+        max_len: int = 128,
+        cache_size: int = 50,
+    ):
+        self.pairs = pairs
+        self.zh_tokenizer = zh_tokenizer
+        self.en_tokenizer = en_tokenizer
+        self.max_len = max_len
+        self.cache_size = cache_size
+        
+        # 异步 tokenize 相关
+        self._cache: Dict[int, Dict[str, Any]] = {}
+        self._cache_lock = threading.Lock()
+        self._prefetch_queue = queue.Queue(maxsize=cache_size)
+        self._stop_prefetch = threading.Event()
+        self._prefetch_thread = None
+        self._next_prefetch_idx = 0
+        
+        print(f"  数据集: {len(pairs)} 条 (异步 tokenize, 缓存上限: {cache_size})")
+    
+    def _tokenize_item(self, idx: int) -> Dict[str, Any]:
+        """tokenize 单个数据项"""
+        pair = self.pairs[idx]
+        zh_ids = self.zh_tokenizer.encode(pair.zh, add_sos=True, add_eos=True)[:self.max_len]
+        en_ids = self.en_tokenizer.encode(pair.en, add_sos=True, add_eos=True)[:self.max_len]
+        
+        return {
+            'zh_ids': torch.tensor(zh_ids, dtype=torch.long),
+            'en_ids': torch.tensor(en_ids, dtype=torch.long),
+            'zh_len': len(zh_ids),
+            'en_len': len(en_ids),
+            'zh_text': pair.zh,
+            'en_text': pair.en,
+        }
+    
+    def _prefetch_worker(self):
+        """后台预取线程"""
+        while not self._stop_prefetch.is_set():
+            try:
+                # 检查缓存是否已满
+                with self._cache_lock:
+                    cache_len = len(self._cache)
+                
+                if cache_len >= self.cache_size:
+                    # 缓存已满，等待
+                    self._stop_prefetch.wait(0.1)
+                    continue
+                
+                # 预取下一个
+                if self._next_prefetch_idx >= len(self.pairs):
+                    self._next_prefetch_idx = 0  # 循环
+                
+                idx = self._next_prefetch_idx
+                self._next_prefetch_idx += 1
+                
+                # 检查是否已在缓存中
+                with self._cache_lock:
+                    if idx in self._cache:
+                        continue
+                
+                # tokenize
+                result = self._tokenize_item(idx)
+                
+                # 添加到缓存
+                with self._cache_lock:
+                    if len(self._cache) < self.cache_size:
+                        self._cache[idx] = result
+                        
+            except Exception as e:
+                print(f"预取错误: {e}")
+                break
+    
+    def start_prefetch(self):
+        """启动预取线程"""
+        if self._prefetch_thread is None or not self._prefetch_thread.is_alive():
+            self._stop_prefetch.clear()
+            self._prefetch_thread = threading.Thread(target=self._prefetch_worker, daemon=True)
+            self._prefetch_thread.start()
+    
+    def stop_prefetch(self):
+        """停止预取线程"""
+        self._stop_prefetch.set()
+        if self._prefetch_thread:
+            self._prefetch_thread.join(timeout=1.0)
+    
+    def __len__(self) -> int:
+        return len(self.pairs)
+    
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        # 先检查缓存
+        with self._cache_lock:
+            if idx in self._cache:
+                result = self._cache.pop(idx)  # 取出并移除，让出缓存空间
+                return result
+        
+        # 缓存未命中，同步 tokenize
+        result = self._tokenize_item(idx)
+        return result
+    
+    def remove_from_cache(self, idx: int):
+        """从缓存中移除已使用的数据项"""
+        with self._cache_lock:
+            if idx in self._cache:
+                del self._cache[idx]
+
+
 def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
     """批处理函数，动态padding"""
     zh_ids_list = [item['zh_ids'] for item in batch]
@@ -110,41 +228,6 @@ def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
         'zh_texts': [item['zh_text'] for item in batch],
         'en_texts': [item['en_text'] for item in batch],
     }
-
-
-def load_tatoeba(path: str, max_samples: Optional[int] = None) -> List[TranslationPair]:
-    """加载tatoeba数据集
-    
-    格式: 编号\t中文\t编号\t英文
-    """
-    pairs = []
-    seen = set()
-    
-    with open(path, 'r', encoding='utf-8') as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            
-            parts = line.split('\t')
-            if len(parts) < 4:
-                continue
-            
-            zh = parts[1].strip()
-            en = parts[3].strip()
-            
-            # 去重
-            key = (zh, en)
-            if key in seen:
-                continue
-            seen.add(key)
-            
-            pairs.append(TranslationPair(zh=zh, en=en))
-            
-            if max_samples and len(pairs) >= max_samples:
-                break
-    
-    return pairs
 
 
 def load_cveto(zh_path: str, en_path: str, max_samples: Optional[int] = None) -> List[TranslationPair]:
@@ -188,33 +271,16 @@ def load_all_data(config) -> Tuple[List[TranslationPair], List[TranslationPair],
     """加载所有数据，返回训练集、验证集、测试集"""
     print("加载数据集...")
     
-    # 加载tatoeba
-    tatoeba_path = config.data.tatoeba_path
-    if os.path.exists(tatoeba_path):
-        print(f"  加载 tatoeba: {tatoeba_path}")
-        tatoeba_pairs = load_tatoeba(tatoeba_path, max_samples=config.data.max_samples)
-        print(f"    句对数: {len(tatoeba_pairs)}")
-    else:
-        tatoeba_pairs = []
-        print(f"  警告: tatoeba路径不存在: {tatoeba_path}")
+    # 只加载cveto
+    cveto_zh_path = config.data.cveto_zh_path
+    cveto_en_path = config.data.cveto_en_path
     
-    # 合并所有数据
-    all_pairs = tatoeba_pairs.copy()
+    if not os.path.exists(cveto_zh_path) or not os.path.exists(cveto_en_path):
+        raise FileNotFoundError(f"cveto数据集不存在: {cveto_zh_path} 或 {cveto_en_path}")
     
-    # 如果还需要更多数据，加载cveto
-    if config.data.max_samples is None or len(all_pairs) < config.data.max_samples:
-        cveto_zh_path = config.data.cveto_zh_path
-        cveto_en_path = config.data.cveto_en_path
-        
-        if os.path.exists(cveto_zh_path) and os.path.exists(cveto_en_path):
-            print(f"  加载 cveto...")
-            remaining = None
-            if config.data.max_samples:
-                remaining = config.data.max_samples - len(all_pairs)
-            
-            cveto_pairs = load_cveto(cveto_zh_path, cveto_en_path, max_samples=remaining)
-            print(f"    句对数: {len(cveto_pairs)}")
-            all_pairs.extend(cveto_pairs)
+    print(f"  加载 cveto...")
+    all_pairs = load_cveto(cveto_zh_path, cveto_en_path, max_samples=config.data.max_samples)
+    print(f"    句对数: {len(all_pairs)}")
     
     # 过滤长度
     print(f"  过滤数据...", end="", flush=True)
@@ -263,13 +329,17 @@ def create_dataloaders(
     zh_tokenizer: Tokenizer,
     en_tokenizer: Tokenizer,
     config,
+    use_async_tokenize: bool = True,
 ) -> Tuple[DataLoader, DataLoader]:
     """创建数据加载器"""
-    train_dataset = TranslationDataset(
+    dataset_class = AsyncTokenizeDataset if use_async_tokenize else TranslationDataset
+    
+    train_dataset = dataset_class(
         train_pairs,
         zh_tokenizer,
         en_tokenizer,
         max_len=config.model.max_len,
+        cache_size=config.data.tokenize_cache_size if use_async_tokenize else 0,
     )
     
     val_dataset = TranslationDataset(
@@ -278,6 +348,10 @@ def create_dataloaders(
         en_tokenizer,
         max_len=config.model.max_len,
     )
+    
+    # 启动异步预取
+    if use_async_tokenize and hasattr(train_dataset, 'start_prefetch'):
+        train_dataset.start_prefetch()
     
     train_loader = DataLoader(
         train_dataset,
